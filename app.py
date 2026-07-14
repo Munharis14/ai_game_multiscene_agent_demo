@@ -16,6 +16,8 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 PROJECT_DIR = Path(__file__).parent
 DOCS_DIR = PROJECT_DIR / "docs"
+DATA_DIR = PROJECT_DIR / "data"
+FEEDBACK_PATH = DATA_DIR / "player_feedback.md"
 PROMPT_PATH = PROJECT_DIR / "prompts" / "system_prompt.md"
 RETRIEVAL_K = 4
 RETRIEVAL_CANDIDATES = 10
@@ -26,6 +28,7 @@ class AgentRun:
     answer: str
     docs: List[Document]
     steps: List[str]
+    tool_name: str
 
 
 class HashEmbeddings(Embeddings):
@@ -187,6 +190,133 @@ def search_game_docs_tool(query: str) -> str:
     return format_context(docs)
 
 
+@tool
+def check_activity_rule_tool(query: str) -> str:
+    """Check whether an activity rule document contains required planning fields."""
+    activity_doc = find_activity_document(query)
+    required_sections = [
+        ("活动名称", "说明活动叫什么，避免运营、客服和玩家口径不一致。"),
+        ("活动时间", "说明活动开始和结束时间，避免时区和重置时间争议。"),
+        ("参与条件", "说明等级、任务进度、服务器等限制。"),
+        ("活动入口", "说明玩家从哪里进入活动。"),
+        ("活动玩法", "说明核心玩法和每日/每周限制。"),
+        ("活动奖励", "说明奖励类型、兑换方式和发放方式。"),
+        ("奖励发放规则", "说明实时发放、邮件发放、临时仓库等规则。"),
+        ("异常处理", "说明客服遇到异常时需要核对哪些信息。"),
+    ]
+    content = activity_doc.page_content
+    rows = []
+    missing = []
+    for section, reason in required_sections:
+        exists = f"## {section}" in content or section in content
+        status = "通过" if exists else "缺失"
+        rows.append(f"| {section} | {status} | {reason} |")
+        if not exists:
+            missing.append(section)
+
+    if missing:
+        conclusion = f"当前活动规则还有 {len(missing)} 个关键字段需要补充：{', '.join(missing)}。"
+    else:
+        conclusion = "当前活动规则包含核心字段，可以作为活动上线前的基础检查样例。"
+
+    return "\n".join(
+        [
+            f"## 活动规则完整性检查",
+            "",
+            f"检查文档：`{activity_doc.metadata.get('source', 'unknown')}`",
+            "",
+            "| 检查项 | 状态 | 检查意义 |",
+            "| --- | --- | --- |",
+            *rows,
+            "",
+            f"结论：{conclusion}",
+            "",
+            "建议：正式落地时可以把该工具接入策划文档评审流程，在活动上线前自动检查规则字段是否齐全。",
+        ]
+    )
+
+
+@tool
+def summarize_player_feedback_tool(query: str) -> str:
+    """Summarize sample player feedback into issues, sentiment, and action suggestions."""
+    feedback_items = load_player_feedback()
+    categories = {
+        "活动与奖励": ["活动", "奖励", "积分", "兑换", "补偿", "排行榜"],
+        "充值与订单": ["充值", "不到账", "订单", "支付", "补单"],
+        "性能与稳定性": ["卡顿", "闪退", "加载", "延迟", "发热"],
+        "新手体验": ["新手", "引导", "任务", "迷路", "教程"],
+        "账号与安全": ["封禁", "申诉", "账号", "登录"],
+    }
+    negative_words = ["不到账", "卡顿", "闪退", "太难", "没收到", "封禁", "迷路", "延迟", "不清楚"]
+    positive_words = ["喜欢", "清楚", "好看", "顺畅", "不错", "满意"]
+
+    category_counts = {name: 0 for name in categories}
+    negative_count = 0
+    positive_count = 0
+    for item in feedback_items:
+        for name, keywords in categories.items():
+            if any(keyword in item for keyword in keywords):
+                category_counts[name] += 1
+        if any(word in item for word in negative_words):
+            negative_count += 1
+        if any(word in item for word in positive_words):
+            positive_count += 1
+
+    sorted_categories = sorted(category_counts.items(), key=lambda pair: pair[1], reverse=True)
+    top_rows = [f"| {name} | {count} |" for name, count in sorted_categories if count]
+    sample_rows = [f"- {item}" for item in feedback_items[:5]]
+
+    if negative_count > positive_count:
+        sentiment = "负向反馈较多，需要优先关注活动奖励、充值订单和性能稳定性。"
+    elif positive_count > negative_count:
+        sentiment = "正向反馈较多，但仍需要持续观察高频问题。"
+    else:
+        sentiment = "正负反馈接近，建议结合真实工单量和玩家分层继续判断。"
+
+    return "\n".join(
+        [
+            "## 玩家反馈摘要",
+            "",
+            f"样本数量：{len(feedback_items)} 条",
+            "",
+            "| 问题类别 | 命中次数 |",
+            "| --- | --- |",
+            *top_rows,
+            "",
+            f"情绪判断：{sentiment}",
+            "",
+            "代表性反馈：",
+            *sample_rows,
+            "",
+            "处理建议：",
+            "- 优先排查充值不到账和活动奖励未到账问题，避免影响玩家信任。",
+            "- 将卡顿、闪退、加载慢反馈同步给测试和客户端团队复现。",
+            "- 对新手引导和活动入口说明进行文案优化，降低客服咨询量。",
+        ]
+    )
+
+
+def find_activity_document(query: str) -> Document:
+    documents = load_markdown_documents()
+    preferred_terms = ["活动规则", "夏日星潮", "活动"]
+    for term in preferred_terms:
+        for document in documents:
+            source = document.metadata.get("source", "")
+            if term in source or term in document.page_content:
+                return document
+    return documents[0]
+
+
+def load_player_feedback() -> List[str]:
+    content = FEEDBACK_PATH.read_text(encoding="utf-8")
+    items = []
+    for line in content.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("- "):
+            items.append(stripped[2:])
+    return items
+
+
 def answer_with_llm(question: str, docs: List[Document]) -> str:
     api_key = os.getenv("OPENAI_API_KEY", "").strip()
     if not api_key:
@@ -247,11 +377,33 @@ def fallback_answer(question: str, docs: List[Document]) -> str:
     )
 
 
-def run_document_agent(question: str) -> AgentRun:
-    steps = [
-        "接收用户问题，并判断需要查询游戏研发知识库。",
-        f"选择工具 `{search_game_docs_tool.name}` 检索活动规则、客服 FAQ、道具规则和版本公告等资料。",
-    ]
+def select_agent_tool(question: str) -> str:
+    if any(keyword in question for keyword in ["反馈", "舆情", "评论", "玩家声音", "吐槽", "满意"]):
+        return summarize_player_feedback_tool.name
+    if any(keyword in question for keyword in ["检查", "完整", "缺失", "活动规则", "规则文档", "字段"]):
+        return check_activity_rule_tool.name
+    return search_game_docs_tool.name
+
+
+def run_multi_scene_agent(question: str) -> AgentRun:
+    tool_name = select_agent_tool(question)
+    steps = ["接收用户问题，并判断问题属于哪个游戏研发场景。"]
+
+    if tool_name == check_activity_rule_tool.name:
+        steps.append(f"选择工具 `{check_activity_rule_tool.name}` 检查活动规则文档是否包含关键字段。")
+        answer = check_activity_rule_tool.invoke({"query": question})
+        steps.append("工具读取活动规则文档，并按活动名称、时间、参与条件、奖励、异常处理等字段逐项检查。")
+        steps.append("输出检查表和补充建议，供策划评审或上线前自查使用。")
+        return AgentRun(answer=answer, docs=[], steps=steps, tool_name=tool_name)
+
+    if tool_name == summarize_player_feedback_tool.name:
+        steps.append(f"选择工具 `{summarize_player_feedback_tool.name}` 汇总玩家反馈样本。")
+        answer = summarize_player_feedback_tool.invoke({"query": question})
+        steps.append("工具读取玩家反馈样本，按活动奖励、充值订单、性能稳定性等类别统计高频问题。")
+        steps.append("输出情绪判断和处理建议，供运营复盘和问题分发使用。")
+        return AgentRun(answer=answer, docs=[], steps=steps, tool_name=tool_name)
+
+    steps.append(f"选择工具 `{search_game_docs_tool.name}` 检索活动规则、客服 FAQ、道具规则和版本公告等资料。")
     docs = retrieve_game_docs(question)
     sources = sorted({doc.metadata.get("source", "unknown") for doc in docs})
     steps.append(f"工具返回 {len(docs)} 个相关片段，来源包括：{', '.join(sources)}。")
@@ -262,22 +414,22 @@ def run_document_agent(question: str) -> AgentRun:
     else:
         steps.append("当前未配置可用模型额度，使用本地检索摘要作为兜底回答。")
     steps.append("向用户展示答案和引用来源，便于人工复核。")
-    return AgentRun(answer=answer, docs=docs, steps=steps)
+    return AgentRun(answer=answer, docs=docs, steps=steps, tool_name=tool_name)
 
 
 def main() -> None:
     load_dotenv()
     st.set_page_config(
-        page_title="游戏研发文档问答助手",
+        page_title="游戏研发多场景 AI Agent",
         page_icon="",
         layout="wide",
     )
 
-    st.title("游戏研发文档问答 Agent")
-    st.caption("LangChain + Tool + Chroma + Streamlit 的最小 Agent/RAG Demo")
+    st.title("游戏研发多场景 AI Agent")
+    st.caption("LangChain + Tool + Chroma + Streamlit 的多场景 Agent/RAG Demo")
 
     with st.sidebar:
-        st.header("Demo 文档")
+        st.header("Demo 资料")
         docs = load_markdown_documents()
         st.write(f"已加载 {len(docs)} 份 Markdown 文档")
         for doc in docs:
@@ -290,7 +442,12 @@ def main() -> None:
             st.warning("未配置 API Key，当前使用检索摘要兜底模式")
 
         st.header("Agent 工具")
-        st.code(search_game_docs_tool.name)
+        for tool_name in [
+            search_game_docs_tool.name,
+            check_activity_rule_tool.name,
+            summarize_player_feedback_tool.name,
+        ]:
+            st.code(tool_name)
 
         if st.button("重建索引"):
             build_vector_store.clear()
@@ -298,15 +455,15 @@ def main() -> None:
 
     question = st.text_input(
         "请输入问题",
-        placeholder="例如：夏日星潮活动的参与条件是什么？",
+        placeholder="例如：检查夏日星潮活动规则是否完整",
     )
 
     examples = [
         "新手任务第一步是什么？",
         "夏日星潮活动的参与条件是什么？",
+        "检查夏日星潮活动规则是否完整",
+        "帮我总结一下玩家反馈里的主要问题",
         "充值不到账客服应该怎么处理？",
-        "背包满了奖励会丢失吗？",
-        "本次版本新增了哪些内容？",
     ]
 
     st.write("示例问题：")
@@ -316,8 +473,10 @@ def main() -> None:
             question = example
 
     if question:
-        with st.spinner("Agent 正在选择工具、检索文档并生成回答..."):
-            agent_run = run_document_agent(question)
+        with st.spinner("Agent 正在选择工具并处理任务..."):
+            agent_run = run_multi_scene_agent(question)
+
+        st.info(f"本次调用工具：`{agent_run.tool_name}`")
 
         st.subheader("回答")
         st.markdown(agent_run.answer)
@@ -326,11 +485,12 @@ def main() -> None:
         for index, step in enumerate(agent_run.steps, start=1):
             st.markdown(f"{index}. {step}")
 
-        st.subheader("引用来源")
-        for index, doc in enumerate(agent_run.docs, start=1):
-            source = doc.metadata.get("source", "unknown")
-            with st.expander(f"片段 {index}：{source}"):
-                st.write(doc.page_content)
+        if agent_run.docs:
+            st.subheader("引用来源")
+            for index, doc in enumerate(agent_run.docs, start=1):
+                source = doc.metadata.get("source", "unknown")
+                with st.expander(f"片段 {index}：{source}"):
+                    st.write(doc.page_content)
 
 
 if __name__ == "__main__":

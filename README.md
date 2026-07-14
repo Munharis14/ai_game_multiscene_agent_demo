@@ -1,10 +1,10 @@
-# 游戏研发文档问答 Agent Demo
+# 游戏研发多场景 AI Agent Demo
 
-这是一个基于 `Python + Streamlit + LangChain + Chroma` 的最小 Agent/RAG Demo，用于验证 AI 在游戏研发文档问答场景中的落地可行性。
+这是一个基于 `Python + Streamlit + LangChain + Chroma` 的多场景 Agent/RAG Demo，用于验证 AI 在游戏研发知识检索、策划规则检查和运营反馈分析场景中的落地可行性。
 
 ## Demo 目标
 
-游戏项目中常见的问题是文档分散、查询成本高、新人理解项目慢。该 Demo 将模拟游戏策划文档、活动规则、道具规则、客服 FAQ 和版本公告接入本地知识库，用户可以通过自然语言提问，Agent 会选择文档检索工具，检索相关文档片段并生成回答，同时展示执行过程和引用来源。
+游戏项目中常见的问题包括文档分散、活动规则检查依赖人工经验、玩家反馈整理耗时较长。该 Demo 将模拟游戏策划文档、活动规则、道具规则、客服 FAQ、版本公告和玩家反馈样本接入本地原型，用户可以通过自然语言提问，Agent 会根据问题选择合适工具并展示执行过程。
 
 ## 技术路线
 
@@ -13,10 +13,9 @@ Markdown 文档
   -> 文档切分
   -> Embedding 向量化
   -> Chroma 向量库
-  -> Agent 调用文档检索工具
-  -> 相似片段检索
-  -> LLM 基于片段回答
-  -> 展示答案、执行过程和引用来源
+  -> Agent 判断任务类型
+  -> 调用文档检索 / 活动规则检查 / 玩家反馈摘要工具
+  -> 返回答案、执行过程和引用来源
 ```
 
 ## 项目结构
@@ -33,6 +32,8 @@ ai-game-rag-demo/
 │  ├─ 道具与奖励规则.md
 │  ├─ 客服FAQ.md
 │  └─ 版本更新公告.md
+├─ data/
+│  └─ player_feedback.md
 ├─ prompts/
 │  └─ system_prompt.md
 └─ report/
@@ -93,39 +94,41 @@ http://127.0.0.1:8700
 
 - 新手任务第一步是什么？
 - 夏日星潮活动的参与条件是什么？
+- 检查夏日星潮活动规则是否完整
+- 帮我总结一下玩家反馈里的主要问题
 - 充值不到账客服应该怎么处理？
-- 背包满了奖励会丢失吗？
-- 本次版本新增了哪些内容？
 
 ## 演示重点
 
 1. 展示 `docs/` 中的游戏研发文档。
-2. 输入问题。
-3. 系统检索相关文档片段。
-4. Agent 展示执行过程，包括选择工具、检索片段、组装 Prompt 和生成回答。
-5. 系统生成回答。
-6. 展示引用来源，说明回答不是凭空编造。
+2. 展示 `data/` 中的玩家反馈样本。
+3. 输入不同类型的问题。
+4. Agent 自动选择对应 Tool。
+5. 页面展示执行过程、工具输出和引用来源。
 
 ## Agent 设计
 
-当前 Demo 将知识库检索封装为一个 LangChain Tool：
+当前 Demo 将三个游戏研发场景封装为 LangChain Tool：
 
 ```text
 search_game_docs_tool
+check_activity_rule_tool
+summarize_player_feedback_tool
 ```
+
+三个 Tool 的职责如下：
+
+| Tool | 场景 | 作用 |
+| --- | --- | --- |
+| `search_game_docs_tool` | 研发知识检索、客服问答 | 检索游戏 Markdown 文档，并返回相关片段和来源 |
+| `check_activity_rule_tool` | 策划规则检查 | 检查活动规则是否包含活动名称、时间、参与条件、入口、奖励、异常处理等字段 |
+| `summarize_player_feedback_tool` | 运营反馈分析 | 汇总玩家反馈样本，输出高频问题、情绪判断和处理建议 |
 
 Agent 的最小执行链路是：
 
 ```text
-接收问题 -> 判断需要查询知识库 -> 调用文档检索工具 -> 组装 Prompt -> 调用模型/兜底摘要 -> 返回答案和引用
+接收问题 -> 判断任务场景 -> 选择 Tool -> 执行工具 -> 整理输出 -> 展示执行过程
 ```
-
-这个设计可以继续扩展更多工具，例如：
-
-- `search_customer_faq_tool`：客服 FAQ 检索。
-- `check_config_table_tool`：配置表规则检查。
-- `summarize_feedback_tool`：玩家反馈摘要。
-- `analyze_test_log_tool`：测试日志分析。
 
 ## 注意事项
 
