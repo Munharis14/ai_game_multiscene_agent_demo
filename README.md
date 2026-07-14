@@ -21,7 +21,7 @@ Markdown 文档
 ## 项目结构
 
 ```text
-ai-game-rag-demo/
+ai_game_multiscene_agent_demo/
 ├─ app.py
 ├─ requirements.txt
 ├─ .env.example
@@ -46,7 +46,7 @@ ai-game-rag-demo/
 ### 1. 创建虚拟环境
 
 ```powershell
-cd D:\Users\Desktop\ai-game-rag-demo
+cd D:\Users\Desktop\ai_game_multiscene_agent_demo
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 ```
