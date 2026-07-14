@@ -74,6 +74,15 @@ CHAT_MODEL=gpt-4o-mini
 EMBEDDING_MODEL=text-embedding-3-small
 ```
 
+如果使用阿里云百炼 / Qwen，可以这样配置：
+
+```text
+OPENAI_API_KEY=你的 DashScope API Key
+OPENAI_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
+CHAT_MODEL=qwen-plus
+EMBEDDING_MODEL=text-embedding-v4
+```
+
 如果暂时没有 API Key，也可以直接运行。系统会使用本地轻量检索兜底模式，返回相关文档片段摘要。
 
 ### 4. 启动应用
