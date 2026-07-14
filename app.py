@@ -128,6 +128,8 @@ def get_embeddings() -> Embeddings:
             model=embedding_model,
             api_key=api_key,
             base_url=base_url,
+            tiktoken_enabled=False,
+            check_embedding_ctx_length=False,
         )
 
     return HashEmbeddings()
