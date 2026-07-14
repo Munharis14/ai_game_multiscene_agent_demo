@@ -1,10 +1,10 @@
-# 游戏研发文档问答助手 Demo
+# 游戏研发文档问答 Agent Demo
 
-这是一个基于 `Python + Streamlit + LangChain + Chroma` 的最小 RAG Demo，用于验证 AI 在游戏研发文档问答场景中的落地可行性。
+这是一个基于 `Python + Streamlit + LangChain + Chroma` 的最小 Agent/RAG Demo，用于验证 AI 在游戏研发文档问答场景中的落地可行性。
 
 ## Demo 目标
 
-游戏项目中常见的问题是文档分散、查询成本高、新人理解项目慢。该 Demo 将模拟游戏策划文档、活动规则、道具规则、客服 FAQ 和版本公告接入本地知识库，用户可以通过自然语言提问，系统会检索相关文档片段并生成回答，同时展示引用来源。
+游戏项目中常见的问题是文档分散、查询成本高、新人理解项目慢。该 Demo 将模拟游戏策划文档、活动规则、道具规则、客服 FAQ 和版本公告接入本地知识库，用户可以通过自然语言提问，Agent 会选择文档检索工具，检索相关文档片段并生成回答，同时展示执行过程和引用来源。
 
 ## 技术路线
 
@@ -13,9 +13,10 @@ Markdown 文档
   -> 文档切分
   -> Embedding 向量化
   -> Chroma 向量库
+  -> Agent 调用文档检索工具
   -> 相似片段检索
   -> LLM 基于片段回答
-  -> 展示答案和引用来源
+  -> 展示答案、执行过程和引用来源
 ```
 
 ## 项目结构
@@ -35,7 +36,8 @@ ai-game-rag-demo/
 ├─ prompts/
 │  └─ system_prompt.md
 └─ report/
-   └─ Demo说明.md
+   ├─ Demo说明.md
+   └─ Demo测试记录.md
 ```
 
 ## 运行方式
@@ -100,11 +102,33 @@ http://127.0.0.1:8700
 1. 展示 `docs/` 中的游戏研发文档。
 2. 输入问题。
 3. 系统检索相关文档片段。
-4. 系统生成回答。
-5. 展示引用来源，说明回答不是凭空编造。
+4. Agent 展示执行过程，包括选择工具、检索片段、组装 Prompt 和生成回答。
+5. 系统生成回答。
+6. 展示引用来源，说明回答不是凭空编造。
+
+## Agent 设计
+
+当前 Demo 将知识库检索封装为一个 LangChain Tool：
+
+```text
+search_game_docs_tool
+```
+
+Agent 的最小执行链路是：
+
+```text
+接收问题 -> 判断需要查询知识库 -> 调用文档检索工具 -> 组装 Prompt -> 调用模型/兜底摘要 -> 返回答案和引用
+```
+
+这个设计可以继续扩展更多工具，例如：
+
+- `search_customer_faq_tool`：客服 FAQ 检索。
+- `check_config_table_tool`：配置表规则检查。
+- `summarize_feedback_tool`：玩家反馈摘要。
+- `analyze_test_log_tool`：测试日志分析。
 
 ## 注意事项
 
 - 不要提交 `.env`。
 - 不要上传真实公司文档、真实玩家数据、订单信息或内部代码。
-- `chroma_db/` 是本地向量库缓存，不需要提交到 GitHub。
+- 当前版本使用内存 Chroma 索引，避免 Windows 本地 SQLite 文件被占用。

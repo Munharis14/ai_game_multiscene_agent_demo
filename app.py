@@ -1,5 +1,6 @@
 import os
 import hashlib
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, List
 
@@ -8,6 +9,7 @@ from dotenv import load_dotenv
 from langchain_chroma import Chroma
 from langchain_core.documents import Document
 from langchain_core.embeddings import Embeddings
+from langchain_core.tools import tool
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
@@ -15,6 +17,15 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 PROJECT_DIR = Path(__file__).parent
 DOCS_DIR = PROJECT_DIR / "docs"
 PROMPT_PATH = PROJECT_DIR / "prompts" / "system_prompt.md"
+RETRIEVAL_K = 4
+RETRIEVAL_CANDIDATES = 10
+
+
+@dataclass
+class AgentRun:
+    answer: str
+    docs: List[Document]
+    steps: List[str]
 
 
 class HashEmbeddings(Embeddings):
@@ -151,6 +162,31 @@ def format_context(docs: List[Document]) -> str:
     return "\n\n".join(parts)
 
 
+def retrieve_game_docs(question: str) -> List[Document]:
+    vector_store = build_vector_store()
+    retriever = vector_store.as_retriever(search_kwargs={"k": RETRIEVAL_CANDIDATES})
+    docs = retriever.invoke(question)
+    return rerank_documents(question, docs)[:RETRIEVAL_K]
+
+
+def rerank_documents(question: str, docs: List[Document]) -> List[Document]:
+    query_terms = {term for term in HashEmbeddings._tokens(question) if term.strip()}
+
+    def score(doc: Document) -> int:
+        source = doc.metadata.get("source", "")
+        content = f"{source}\n{doc.page_content}".lower()
+        return sum(len(term) for term in query_terms if term in content)
+
+    return sorted(docs, key=score, reverse=True)
+
+
+@tool
+def search_game_docs_tool(query: str) -> str:
+    """Search game project documents and return relevant snippets with sources."""
+    docs = retrieve_game_docs(query)
+    return format_context(docs)
+
+
 def answer_with_llm(question: str, docs: List[Document]) -> str:
     api_key = os.getenv("OPENAI_API_KEY", "").strip()
     if not api_key:
@@ -193,15 +229,40 @@ def fallback_answer(question: str, docs: List[Document]) -> str:
         text = doc.page_content.replace("\n", " ").strip()
         snippets.append(text[:260] + ("..." if len(text) > 260 else ""))
 
+    if os.getenv("OPENAI_API_KEY", "").strip():
+        model_status = "模型 API 暂不可用，因此先返回检索结果摘要。"
+        next_step = "模型额度或服务恢复后，系统会调用大语言模型基于这些片段生成正式回答。"
+    else:
+        model_status = "当前未配置模型 API Key，因此先返回检索结果摘要。"
+        next_step = "配置 OPENAI_API_KEY 后，系统会调用大语言模型基于这些片段生成正式回答。"
+
     return (
-        "当前未配置模型 API Key，因此先返回检索结果摘要。\n\n"
+        f"{model_status}\n\n"
         f"问题：{question}\n\n"
         "可能相关资料：\n"
         + "\n\n".join(f"- {snippet}" for snippet in snippets)
         + "\n\n"
         f"来源：{', '.join(sources)}\n\n"
-        "配置 OPENAI_API_KEY 后，系统会调用大语言模型基于这些片段生成正式回答。"
+        f"{next_step}"
     )
+
+
+def run_document_agent(question: str) -> AgentRun:
+    steps = [
+        "接收用户问题，并判断需要查询游戏研发知识库。",
+        f"选择工具 `{search_game_docs_tool.name}` 检索活动规则、客服 FAQ、道具规则和版本公告等资料。",
+    ]
+    docs = retrieve_game_docs(question)
+    sources = sorted({doc.metadata.get("source", "unknown") for doc in docs})
+    steps.append(f"工具返回 {len(docs)} 个相关片段，来源包括：{', '.join(sources)}。")
+    steps.append("将用户问题和检索片段组装成 Prompt，要求模型基于资料回答并保留依据。")
+    answer = answer_with_llm(question, docs)
+    if os.getenv("OPENAI_API_KEY", "").strip():
+        steps.append("调用大语言模型生成回答；如果模型不可用，则自动返回检索摘要。")
+    else:
+        steps.append("当前未配置可用模型额度，使用本地检索摘要作为兜底回答。")
+    steps.append("向用户展示答案和引用来源，便于人工复核。")
+    return AgentRun(answer=answer, docs=docs, steps=steps)
 
 
 def main() -> None:
@@ -212,8 +273,8 @@ def main() -> None:
         layout="wide",
     )
 
-    st.title("游戏研发文档问答助手")
-    st.caption("LangChain + Chroma + Streamlit 的最小 RAG Demo")
+    st.title("游戏研发文档问答 Agent")
+    st.caption("LangChain + Tool + Chroma + Streamlit 的最小 Agent/RAG Demo")
 
     with st.sidebar:
         st.header("Demo 文档")
@@ -227,6 +288,9 @@ def main() -> None:
             st.success("已配置模型 API Key")
         else:
             st.warning("未配置 API Key，当前使用检索摘要兜底模式")
+
+        st.header("Agent 工具")
+        st.code(search_game_docs_tool.name)
 
         if st.button("重建索引"):
             build_vector_store.clear()
@@ -252,17 +316,18 @@ def main() -> None:
             question = example
 
     if question:
-        with st.spinner("正在检索文档并生成回答..."):
-            vector_store = build_vector_store()
-            retriever = vector_store.as_retriever(search_kwargs={"k": 4})
-            docs = retriever.invoke(question)
-            answer = answer_with_llm(question, docs)
+        with st.spinner("Agent 正在选择工具、检索文档并生成回答..."):
+            agent_run = run_document_agent(question)
 
         st.subheader("回答")
-        st.markdown(answer)
+        st.markdown(agent_run.answer)
+
+        st.subheader("Agent 执行过程")
+        for index, step in enumerate(agent_run.steps, start=1):
+            st.markdown(f"{index}. {step}")
 
         st.subheader("引用来源")
-        for index, doc in enumerate(docs, start=1):
+        for index, doc in enumerate(agent_run.docs, start=1):
             source = doc.metadata.get("source", "unknown")
             with st.expander(f"片段 {index}：{source}"):
                 st.write(doc.page_content)
