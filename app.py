@@ -21,6 +21,8 @@ FEEDBACK_PATH = DATA_DIR / "player_feedback.md"
 PROMPT_PATH = PROJECT_DIR / "prompts" / "system_prompt.md"
 RETRIEVAL_K = 4
 RETRIEVAL_CANDIDATES = 10
+MEMORY_TURNS = 5
+MEMORY_SNIPPET_LIMIT = 700
 
 
 @dataclass
@@ -187,6 +189,47 @@ def strip_markdown_fence(text: str) -> str:
     return stripped
 
 
+def compact_text(text: str, limit: int = MEMORY_SNIPPET_LIMIT) -> str:
+    compacted = " ".join(str(text).split())
+    if len(compacted) <= limit:
+        return compacted
+    return compacted[:limit].rstrip() + "..."
+
+
+def get_recent_chat_history() -> List[dict[str, str]]:
+    return st.session_state.get("chat_history", [])[-MEMORY_TURNS:]
+
+
+def format_chat_history(chat_history: List[dict[str, str]]) -> str:
+    if not chat_history:
+        return "无"
+
+    turns = []
+    for index, item in enumerate(chat_history[-MEMORY_TURNS:], start=1):
+        question = compact_text(item.get("question", ""))
+        answer = compact_text(item.get("answer", ""))
+        tool_name = item.get("tool_name", "unknown")
+        turns.append(
+            f"第 {index} 轮\n"
+            f"用户：{question}\n"
+            f"助手：{answer}\n"
+            f"使用工具：{tool_name}"
+        )
+    return "\n\n".join(turns)
+
+
+def build_contextual_query(question: str, chat_history: List[dict[str, str]]) -> str:
+    if not chat_history:
+        return question
+
+    return (
+        "最近对话上下文：\n"
+        f"{format_chat_history(chat_history)}\n\n"
+        "当前用户问题：\n"
+        f"{question}"
+    )
+
+
 def format_context(docs: List[Document]) -> str:
     parts = []
     for index, doc in enumerate(docs, start=1):
@@ -199,18 +242,39 @@ def retrieve_game_docs(question: str) -> List[Document]:
     vector_store = build_vector_store()
     retriever = vector_store.as_retriever(search_kwargs={"k": RETRIEVAL_CANDIDATES})
     docs = retriever.invoke(question)
-    return rerank_documents(question, docs)[:RETRIEVAL_K]
+    keyword_docs = keyword_search_documents(question)
+    candidates = merge_documents(docs, keyword_docs)
+    return rerank_documents(question, candidates)[:RETRIEVAL_K]
+
+
+def keyword_search_documents(question: str) -> List[Document]:
+    documents = split_documents(load_markdown_documents())
+    ranked_docs = rerank_documents(question, documents)
+    return [doc for doc in ranked_docs if document_keyword_score(question, doc) > 0][:RETRIEVAL_CANDIDATES]
+
+
+def merge_documents(*document_groups: List[Document]) -> List[Document]:
+    merged = []
+    seen = set()
+    for documents in document_groups:
+        for doc in documents:
+            key = (doc.metadata.get("source", ""), doc.page_content)
+            if key in seen:
+                continue
+            seen.add(key)
+            merged.append(doc)
+    return merged
 
 
 def rerank_documents(question: str, docs: List[Document]) -> List[Document]:
+    return sorted(docs, key=lambda doc: document_keyword_score(question, doc), reverse=True)
+
+
+def document_keyword_score(question: str, doc: Document) -> int:
     query_terms = {term for term in HashEmbeddings._tokens(question) if term.strip()}
-
-    def score(doc: Document) -> int:
-        source = doc.metadata.get("source", "")
-        content = f"{source}\n{doc.page_content}".lower()
-        return sum(len(term) for term in query_terms if term in content)
-
-    return sorted(docs, key=score, reverse=True)
+    source = doc.metadata.get("source", "")
+    content = f"{source}\n{doc.page_content}".lower()
+    return sum(len(term) for term in query_terms if term in content)
 
 
 @tool
@@ -411,7 +475,11 @@ def load_player_feedback() -> List[str]:
     return items
 
 
-def answer_with_llm(question: str, docs: List[Document]) -> str:
+def answer_with_llm(
+    question: str,
+    docs: List[Document],
+    chat_history: List[dict[str, str]] | None = None,
+) -> str:
     api_key = os.getenv("OPENAI_API_KEY", "").strip()
     if not api_key:
         return fallback_answer(question, docs)
@@ -424,7 +492,11 @@ def answer_with_llm(question: str, docs: List[Document]) -> str:
         base_url=base_url,
         temperature=0.2,
     )
+    history_text = format_chat_history(chat_history or [])
     prompt = f"""{load_system_prompt()}
+
+最近对话上下文：
+{history_text}
 
 用户问题：
 {question}
@@ -471,16 +543,24 @@ def fallback_answer(question: str, docs: List[Document]) -> str:
     )
 
 
-def select_agent_tool_by_keywords(question: str) -> str:
-    if any(keyword in question for keyword in ["反馈", "舆情", "评论", "玩家声音", "吐槽", "满意"]):
+def select_agent_tool_by_keywords(
+    question: str,
+    chat_history: List[dict[str, str]] | None = None,
+) -> str:
+    context = build_contextual_query(question, chat_history or [])
+    if any(keyword in context for keyword in ["反馈", "舆情", "评论", "玩家声音", "吐槽", "满意"]):
         return summarize_player_feedback_tool.name
-    if any(keyword in question for keyword in ["检查", "完整", "缺失", "活动规则", "规则文档", "字段"]):
+    if any(keyword in context for keyword in ["检查", "完整", "缺失", "活动规则", "规则文档", "字段"]):
         return check_activity_rule_tool.name
     return search_game_docs_tool.name
 
 
-def select_agent_tool(question: str) -> tuple[str, str]:
-    fallback_tool = select_agent_tool_by_keywords(question)
+def select_agent_tool(
+    question: str,
+    chat_history: List[dict[str, str]] | None = None,
+) -> tuple[str, str]:
+    history = chat_history or []
+    fallback_tool = select_agent_tool_by_keywords(question, history)
     available_tools = [
         search_game_docs_tool.name,
         check_activity_rule_tool.name,
@@ -492,6 +572,9 @@ def select_agent_tool(question: str) -> tuple[str, str]:
 1. {search_game_docs_tool.name}：用于查询游戏研发文档、活动规则、客服 FAQ、版本公告、道具规则等资料，并回答具体问题。
 2. {check_activity_rule_tool.name}：用于检查活动规则文档是否完整，适合“检查字段、是否缺失、规则是否完整、上线前审核”类问题。
 3. {summarize_player_feedback_tool.name}：用于汇总玩家反馈、评论、舆情、吐槽和运营问题，输出高频问题和处理建议。
+
+最近对话上下文：
+{format_chat_history(history)}
 
 用户问题：
 {question}
@@ -510,34 +593,41 @@ def select_agent_tool(question: str) -> tuple[str, str]:
     return fallback_tool, "关键词兜底"
 
 
-def run_multi_scene_agent(question: str) -> AgentRun:
-    tool_name, route_method = select_agent_tool(question)
+def run_multi_scene_agent(
+    question: str,
+    chat_history: List[dict[str, str]] | None = None,
+) -> AgentRun:
+    history = chat_history or []
+    contextual_query = build_contextual_query(question, history)
+    tool_name, route_method = select_agent_tool(question, history)
     steps = ["接收用户问题，并判断问题属于哪个游戏研发场景。"]
+    if history:
+        steps.append(f"读取当前会话最近 {min(len(history), MEMORY_TURNS)} 轮短期上下文，用于理解追问和指代。")
     if route_method == "LLM":
-        steps.append("调用大语言模型进行 Tool 选择，模型根据用户意图选择最合适的工具。")
+        steps.append("调用大语言模型进行 Tool 选择，模型会同时参考当前问题和短期上下文。")
     else:
         steps.append("大语言模型路由不可用或返回异常，使用关键词规则兜底选择工具。")
 
     if tool_name == check_activity_rule_tool.name:
         steps.append(f"选择工具 `{check_activity_rule_tool.name}` 检查活动规则文档是否包含关键字段。")
-        answer = check_activity_rule_tool.invoke({"query": question})
+        answer = check_activity_rule_tool.invoke({"query": contextual_query})
         steps.append("工具读取活动规则文档，并按活动名称、时间、参与条件、奖励、异常处理等字段逐项检查。")
         steps.append("输出检查表和补充建议，供策划评审或上线前自查使用。")
         return AgentRun(answer=answer, docs=[], steps=steps, tool_name=tool_name)
 
     if tool_name == summarize_player_feedback_tool.name:
         steps.append(f"选择工具 `{summarize_player_feedback_tool.name}` 汇总玩家反馈样本。")
-        answer = summarize_player_feedback_tool.invoke({"query": question})
+        answer = summarize_player_feedback_tool.invoke({"query": contextual_query})
         steps.append("工具读取玩家反馈样本，先按活动奖励、充值订单、性能稳定性等类别统计高频问题。")
         steps.append("调用大语言模型生成深度运营分析，包括优先级、分发部门和回复建议；模型不可用时返回规则统计摘要。")
         return AgentRun(answer=answer, docs=[], steps=steps, tool_name=tool_name)
 
     steps.append(f"选择工具 `{search_game_docs_tool.name}` 检索活动规则、客服 FAQ、道具规则和版本公告等资料。")
-    docs = retrieve_game_docs(question)
+    docs = retrieve_game_docs(contextual_query)
     sources = sorted({doc.metadata.get("source", "unknown") for doc in docs})
     steps.append(f"工具返回 {len(docs)} 个相关片段，来源包括：{', '.join(sources)}。")
-    steps.append("将用户问题和检索片段组装成 Prompt，要求模型基于资料回答并保留依据。")
-    answer = answer_with_llm(question, docs)
+    steps.append("将用户问题、短期上下文和检索片段组装成 Prompt，要求模型基于资料回答并保留依据。")
+    answer = answer_with_llm(question, docs, history)
     if os.getenv("OPENAI_API_KEY", "").strip():
         steps.append("调用大语言模型生成回答；如果模型不可用，则自动返回检索摘要。")
     else:
@@ -553,6 +643,10 @@ def main() -> None:
         page_icon="",
         layout="wide",
     )
+    if "chat_history" not in st.session_state:
+        st.session_state.chat_history = []
+    if "question_input" not in st.session_state:
+        st.session_state.question_input = ""
 
     st.title("游戏研发多场景 AI Agent")
     st.caption("LangChain + Tool + Chroma + Streamlit 的多场景 Agent/RAG Demo")
@@ -578,6 +672,16 @@ def main() -> None:
         ]:
             st.code(tool_name)
 
+        st.header("短期 Memory")
+        memory_count = len(st.session_state.chat_history)
+        st.write(f"当前保留 {memory_count} / {MEMORY_TURNS} 轮会话上下文")
+        st.caption("Memory 只在当前浏览器会话内有效，用于支持追问和指代，不做长期存储。")
+
+        if st.button("清空上下文"):
+            st.session_state.chat_history = []
+            st.session_state.question_input = ""
+            st.rerun()
+
         if st.button("重建索引"):
             build_vector_store.clear()
             st.rerun()
@@ -585,6 +689,7 @@ def main() -> None:
     question = st.text_input(
         "请输入问题",
         placeholder="例如：检查夏日星潮活动规则是否完整",
+        key="question_input",
     )
 
     examples = [
@@ -601,9 +706,29 @@ def main() -> None:
         if col.button(example):
             question = example
 
+    recent_history = get_recent_chat_history()
+    if recent_history:
+        st.subheader("短期上下文")
+        for index, item in enumerate(recent_history, start=1):
+            label = f"第 {index} 轮：{compact_text(item.get('question', ''), 36)}"
+            with st.expander(label):
+                st.markdown(f"**用户问题**：{item.get('question', '')}")
+                st.markdown(f"**调用工具**：`{item.get('tool_name', 'unknown')}`")
+                st.markdown("**回答摘要**：")
+                st.markdown(compact_text(item.get("answer", ""), 500))
+
     if question:
         with st.spinner("Agent 正在选择工具并处理任务..."):
-            agent_run = run_multi_scene_agent(question)
+            agent_run = run_multi_scene_agent(question, recent_history)
+
+        st.session_state.chat_history.append(
+            {
+                "question": question,
+                "answer": str(agent_run.answer),
+                "tool_name": agent_run.tool_name,
+            }
+        )
+        st.session_state.chat_history = st.session_state.chat_history[-MEMORY_TURNS:]
 
         st.info(f"本次调用工具：`{agent_run.tool_name}`")
 
