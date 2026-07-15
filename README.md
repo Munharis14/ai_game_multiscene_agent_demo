@@ -88,7 +88,7 @@ EMBEDDING_MODEL=text-embedding-v4
 ### 4. 启动应用
 
 ```powershell
-streamlit run app.py --server.port=8700
+python -m streamlit run app.py --server.port=8700
 ```
 
 浏览器会打开本地页面。如果没有自动打开，可以访问：
