@@ -159,6 +159,34 @@ def load_system_prompt() -> str:
     return PROMPT_PATH.read_text(encoding="utf-8")
 
 
+def call_llm_text(prompt: str, temperature: float = 0.2) -> str:
+    api_key = os.getenv("OPENAI_API_KEY", "").strip()
+    if not api_key:
+        raise RuntimeError("OPENAI_API_KEY is not configured.")
+
+    base_url = os.getenv("OPENAI_BASE_URL", "").strip() or None
+    chat_model = os.getenv("CHAT_MODEL", "gpt-4o-mini").strip()
+    llm = ChatOpenAI(
+        model=chat_model,
+        api_key=api_key,
+        base_url=base_url,
+        temperature=temperature,
+    )
+    response = llm.invoke(prompt)
+    return str(response.content).strip()
+
+
+def strip_markdown_fence(text: str) -> str:
+    stripped = text.strip()
+    if stripped.startswith("```markdown"):
+        stripped = stripped[len("```markdown") :].strip()
+    elif stripped.startswith("```"):
+        stripped = stripped[len("```") :].strip()
+    if stripped.endswith("```"):
+        stripped = stripped[: -len("```")].strip()
+    return stripped
+
+
 def format_context(docs: List[Document]) -> str:
     parts = []
     for index, doc in enumerate(docs, start=1):
@@ -242,6 +270,18 @@ def check_activity_rule_tool(query: str) -> str:
 def summarize_player_feedback_tool(query: str) -> str:
     """Summarize sample player feedback into issues, sentiment, and action suggestions."""
     feedback_items = load_player_feedback()
+    stats = analyze_feedback_items(feedback_items)
+    rule_based_summary = format_feedback_summary(feedback_items, stats)
+    try:
+        return enhance_feedback_summary_with_llm(query, feedback_items, rule_based_summary)
+    except Exception as exc:
+        return (
+            f"{rule_based_summary}\n\n"
+            f"补充说明：LLM 深度分析暂不可用，已返回规则统计摘要。错误类型：{exc.__class__.__name__}"
+        )
+
+
+def analyze_feedback_items(feedback_items: List[str]) -> dict:
     categories = {
         "活动与奖励": ["活动", "奖励", "积分", "兑换", "补偿", "排行榜"],
         "充值与订单": ["充值", "不到账", "订单", "支付", "补单"],
@@ -275,6 +315,18 @@ def summarize_player_feedback_tool(query: str) -> str:
     else:
         sentiment = "正负反馈接近，建议结合真实工单量和玩家分层继续判断。"
 
+    return {
+        "category_counts": sorted_categories,
+        "negative_count": negative_count,
+        "positive_count": positive_count,
+        "sentiment": sentiment,
+    }
+
+
+def format_feedback_summary(feedback_items: List[str], stats: dict) -> str:
+    top_rows = [f"| {name} | {count} |" for name, count in stats["category_counts"] if count]
+    sample_rows = [f"- {item}" for item in feedback_items[:5]]
+
     return "\n".join(
         [
             "## 玩家反馈摘要",
@@ -285,7 +337,7 @@ def summarize_player_feedback_tool(query: str) -> str:
             "| --- | --- |",
             *top_rows,
             "",
-            f"情绪判断：{sentiment}",
+            f"情绪判断：{stats['sentiment']}",
             "",
             "代表性反馈：",
             *sample_rows,
@@ -294,6 +346,46 @@ def summarize_player_feedback_tool(query: str) -> str:
             "- 优先排查充值不到账和活动奖励未到账问题，避免影响玩家信任。",
             "- 将卡顿、闪退、加载慢反馈同步给测试和客户端团队复现。",
             "- 对新手引导和活动入口说明进行文案优化，降低客服咨询量。",
+        ]
+    )
+
+
+def enhance_feedback_summary_with_llm(
+    query: str,
+    feedback_items: List[str],
+    rule_based_summary: str,
+) -> str:
+    feedback_text = "\n".join(f"- {item}" for item in feedback_items)
+    prompt = f"""你是游戏运营分析助手。请基于玩家反馈样本和已有统计摘要，生成一份适合研发/运营复盘的分析结论。
+
+用户问题：
+{query}
+
+玩家反馈样本：
+{feedback_text}
+
+已有统计摘要：
+{rule_based_summary}
+
+请用 Markdown 输出，必须包含：
+1. 高频问题归类
+2. 玩家情绪判断
+3. 处理优先级
+4. 建议分发部门
+5. 运营回复建议
+
+要求：
+- 不要编造样本中不存在的事实。
+- 结论要具体，适合项目组评审。
+- 输出中文。"""
+    llm_summary = call_llm_text(prompt, temperature=0.2)
+    llm_summary = strip_markdown_fence(llm_summary)
+    return "\n\n".join(
+        [
+            llm_summary,
+            "---",
+            "## 规则统计依据",
+            rule_based_summary,
         ]
     )
 
@@ -379,7 +471,7 @@ def fallback_answer(question: str, docs: List[Document]) -> str:
     )
 
 
-def select_agent_tool(question: str) -> str:
+def select_agent_tool_by_keywords(question: str) -> str:
     if any(keyword in question for keyword in ["反馈", "舆情", "评论", "玩家声音", "吐槽", "满意"]):
         return summarize_player_feedback_tool.name
     if any(keyword in question for keyword in ["检查", "完整", "缺失", "活动规则", "规则文档", "字段"]):
@@ -387,9 +479,44 @@ def select_agent_tool(question: str) -> str:
     return search_game_docs_tool.name
 
 
+def select_agent_tool(question: str) -> tuple[str, str]:
+    fallback_tool = select_agent_tool_by_keywords(question)
+    available_tools = [
+        search_game_docs_tool.name,
+        check_activity_rule_tool.name,
+        summarize_player_feedback_tool.name,
+    ]
+    prompt = f"""你是游戏研发多场景 AI Agent 的工具路由器。请根据用户问题，从下面三个工具中选择最合适的一个。
+
+可选工具：
+1. {search_game_docs_tool.name}：用于查询游戏研发文档、活动规则、客服 FAQ、版本公告、道具规则等资料，并回答具体问题。
+2. {check_activity_rule_tool.name}：用于检查活动规则文档是否完整，适合“检查字段、是否缺失、规则是否完整、上线前审核”类问题。
+3. {summarize_player_feedback_tool.name}：用于汇总玩家反馈、评论、舆情、吐槽和运营问题，输出高频问题和处理建议。
+
+用户问题：
+{question}
+
+请只输出工具名，不要输出解释。"""
+    try:
+        selected = call_llm_text(prompt, temperature=0).strip().replace("`", "")
+        first_token = selected.split()[0] if selected.split() else ""
+        if first_token in available_tools:
+            return first_token, "LLM"
+        for tool_name in available_tools:
+            if tool_name in selected:
+                return tool_name, "LLM"
+    except Exception:
+        pass
+    return fallback_tool, "关键词兜底"
+
+
 def run_multi_scene_agent(question: str) -> AgentRun:
-    tool_name = select_agent_tool(question)
+    tool_name, route_method = select_agent_tool(question)
     steps = ["接收用户问题，并判断问题属于哪个游戏研发场景。"]
+    if route_method == "LLM":
+        steps.append("调用大语言模型进行 Tool 选择，模型根据用户意图选择最合适的工具。")
+    else:
+        steps.append("大语言模型路由不可用或返回异常，使用关键词规则兜底选择工具。")
 
     if tool_name == check_activity_rule_tool.name:
         steps.append(f"选择工具 `{check_activity_rule_tool.name}` 检查活动规则文档是否包含关键字段。")
@@ -401,8 +528,8 @@ def run_multi_scene_agent(question: str) -> AgentRun:
     if tool_name == summarize_player_feedback_tool.name:
         steps.append(f"选择工具 `{summarize_player_feedback_tool.name}` 汇总玩家反馈样本。")
         answer = summarize_player_feedback_tool.invoke({"query": question})
-        steps.append("工具读取玩家反馈样本，按活动奖励、充值订单、性能稳定性等类别统计高频问题。")
-        steps.append("输出情绪判断和处理建议，供运营复盘和问题分发使用。")
+        steps.append("工具读取玩家反馈样本，先按活动奖励、充值订单、性能稳定性等类别统计高频问题。")
+        steps.append("调用大语言模型生成深度运营分析，包括优先级、分发部门和回复建议；模型不可用时返回规则统计摘要。")
         return AgentRun(answer=answer, docs=[], steps=steps, tool_name=tool_name)
 
     steps.append(f"选择工具 `{search_game_docs_tool.name}` 检索活动规则、客服 FAQ、道具规则和版本公告等资料。")
